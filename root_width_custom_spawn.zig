@@ -15,6 +15,46 @@ pub const ThreadPoolConfig = struct {
     heartbeat_interval: usize = 100 * std.time.ns_per_us,
 };
 
+fn callFn(comptime f: anytype, args: anytype) ?*anyopaque {
+    const bad_fn_ret = "expected return type of startFn to be 'u8', 'noreturn', '!noreturn', 'void', or '!void'";
+
+    switch (@typeInfo(@typeInfo(@TypeOf(f)).Fn.return_type.?)) {
+        .NoReturn => {
+            @call(.auto, f, args);
+        },
+        .Void => {
+            @call(.auto, f, args);
+            return null;
+        },
+        .Int => |info| {
+            if (info.bits != 8) {
+                @compileError(bad_fn_ret);
+            }
+            _ = @call(.auto, f, args);
+            return null;
+        },
+        .ErrorUnion => |info| {
+            switch (info.payload) {
+                void, noreturn => {
+                    @call(.auto, f, args) catch |err| {
+                        std.debug.print("error: {s}\n", .{@errorName(err)});
+                        if (@errorReturnTrace()) |trace| {
+                            std.debug.dumpStackTrace(trace.*);
+                        }
+                    };
+                    return null;
+                },
+                else => {
+                    @compileError(bad_fn_ret);
+                },
+            }
+        },
+        else => {
+            @compileError(bad_fn_ret);
+        },
+    }
+}
+
 pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
@@ -102,6 +142,50 @@ pub const ThreadPool = struct {
         }
     }
 
+    inline fn spawn(config: std.Thread.SpawnConfig, comptime function: anytype, args: anytype) std.Thread.SpawnError!std.Thread {
+        if (builtin.single_threaded) {
+            @compileError("Cannot spawn thread when building in single-threaded mode");
+        }
+
+        const Args = @TypeOf(args);
+        const allocator = std.heap.c_allocator;
+
+        const Instance = struct {
+            fn entryFn(raw_arg: ?*anyopaque) callconv(.C) ?*anyopaque {
+                const args_ptr: *Args = @ptrCast(@alignCast(raw_arg));
+                defer allocator.destroy(args_ptr);
+                return callFn(function, args_ptr.*);
+            }
+        };
+
+        const args_ptr = try allocator.create(Args);
+        args_ptr.* = args;
+        errdefer allocator.destroy(args_ptr);
+
+        var attr: std.c.pthread_attr_t = undefined;
+        if (std.c.pthread_attr_init(&attr) != .SUCCESS) return error.SystemResources;
+        defer std.debug.assert(std.c.pthread_attr_destroy(&attr) == .SUCCESS);
+
+        // Use the same set of parameters used by the libc-less impl.
+        const stack_size = @max(config.stack_size, 16 * 1024);
+        std.debug.assert(std.c.pthread_attr_setstacksize(&attr, stack_size) == .SUCCESS);
+        std.debug.assert(std.c.pthread_attr_setguardsize(&attr, std.mem.page_size) == .SUCCESS);
+
+        var handle: std.c.pthread_t = undefined;
+        switch (std.c.pthread_create(
+            &handle,
+            &attr,
+            Instance.entryFn,
+            @ptrCast(args_ptr),
+        )) {
+            .SUCCESS => return std.Thread{ .impl = .{ .handle = handle } },
+            .AGAIN => return error.SystemResources,
+            .PERM => unreachable,
+            .INVAL => unreachable,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+
     /// Starts the thread pool. This should only be invoked once.
     pub fn start(self: *ThreadPool, config: ThreadPoolConfig) void {
         const actual_count = config.background_worker_count orelse (getCpuCount() catch @panic("getCpuCount error")) - 1;
@@ -111,11 +195,11 @@ pub const ThreadPool = struct {
         self.workers.ensureUnusedCapacity(self.allocator, actual_count) catch @panic("OOM");
 
         for (0..actual_count) |_| {
-            const thread = std.Thread.spawn(.{}, backgroundWorker, .{self}) catch @panic("spawn error");
+            const thread = spawn(.{}, backgroundWorker, .{self}) catch @panic("spawn error");
             self.background_threads.append(self.allocator, thread) catch @panic("OOM");
         }
 
-        self.heartbeat_thread = std.Thread.spawn(.{}, heartbeatWorker, .{self}) catch @panic("spawn error");
+        self.heartbeat_thread = spawn(.{}, heartbeatWorker, .{self}) catch @panic("spawn error");
 
         // Wait for all of them to be ready:
         for (0..actual_count) |_| {
